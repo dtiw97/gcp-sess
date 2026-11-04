@@ -19,6 +19,8 @@ func main() {
 	router := gin.Default()
 	router.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Second) // simulate a slow in-flight request, to test shutdown later
+		// To simulate case A, where request takes longer than required to shutdown.
+		// time.Sleep(15 * time.Second)
 		c.JSON(http.StatusOK, gin.H{
 			"message": "home",
 		})
@@ -33,7 +35,7 @@ func main() {
 		Handler: router,
 	}
 
-	// App Context detects SIGTERM for termination
+	// ! App Context detects SIGTERM for termination
 	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -44,11 +46,29 @@ func main() {
 		}
 	}()
 	health.SetReady(true)
-	// Channels sleeps main thread until it receives from channel.
-	<-appCtx.Done()
-
-	// Receives signal, proceed
-	stop()
+	<-appCtx.Done() // Channels sleeps main thread until it receives from channel.
+	stop()          // Receives signal, proceed
 	health.SetReady(false)
 
+	// ! ShutDown context, sets a context of 10s
+	shutDownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now() // Current timestamp.
+
+	// Server shutdown with shutDownCtx
+	// 1. Immediately stop accepting new connections.
+	// 2. Waits for request already in flight to finish.
+	if err := server.Shutdown(shutDownCtx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// case A: hit 10s, requests still running → they get cut off
+			log.Printf("Shutdown Timed out after %s, active requests were cut off.",
+				time.Since(start))
+		} else {
+			// case B: some other failure (rare, eg: closing the listener failed)
+			log.Printf("Shutdown failed after %s: %v", time.Since(start), err)
+		}
+	}
+
+	log.Printf("Server shut down complete at %s", time.Since(start))
 }
