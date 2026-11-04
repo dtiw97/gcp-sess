@@ -20,6 +20,12 @@ func (h *HealthHandler) Live(c *gin.Context) {
 	})
 }
 func (h *HealthHandler) Ready(c *gin.Context) {
+	if !h.ready.Load() {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"message": "Not Ready",
+		})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Ready",
 	})
