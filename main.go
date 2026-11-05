@@ -3,13 +3,14 @@ package main
 import (
 	"context"
 	"errors"
-	"gcp-sess/handler"
-	"gcp-sess/routes"
-	"gcp-sess/utils/loggers"
+	h "gcp-sess/handler"
+	r "gcp-sess/routes"
+	u "gcp-sess/utils"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -17,7 +18,12 @@ import (
 )
 
 func main() {
-	loggers.Setup()
+	u.Setup()
+	cfg, err := LoadConfig()
+	if err != nil {
+		slog.Error("invalid config", "err", err)
+		os.Exit(1)
+	}
 	router := gin.Default()
 	router.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Second) // simulate a slow in-flight request, to test shutdown later
@@ -28,12 +34,12 @@ func main() {
 		})
 	})
 
-	health := &handler.HealthHandler{}
-	routes.HealthRoutes(router, health)
+	health := &h.HealthHandler{}
+	r.HealthRoutes(router, health)
 
 	// Setup server
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + strconv.Itoa(cfg.Port),
 		Handler: router,
 	}
 
@@ -54,7 +60,7 @@ func main() {
 	health.SetReady(false)
 
 	// ! ShutDown context, sets a context of 10s
-	shutDownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutDownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	start := time.Now() // Current timestamp.

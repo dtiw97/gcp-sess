@@ -11,7 +11,7 @@ Goal: a Go service that behaves well under Kubernetes. It says when it's ready, 
 | 1.3 | Catch SIGINT/SIGTERM; wire the readiness flag | ✅ | `141e6e7` |
 | 1.4 | Drain in-flight requests with `server.Shutdown` + timeout | ✅ | `bb5c5d3` |
 | 1.5 | Fix: don't log "complete" after a timeout | ✅ | `0d867cf` |
-| 1.6 | Config from environment variables (PORT, SHUTDOWN_TIMEOUT) | 🔄 | |
+| 1.6 | Config from environment variables (PORT, SHUTDOWN_TIMEOUT) | ✅ | see `git log -- config.go` |
 | 1.7 | JSON logs with slog (our own lines) | ✅ | `0d867cf` |
 | 1.8 | DRAIN_DELAY: see `/readyz` answer 503 during shutdown | ⬜ | |
 | 1.9 | Gin request logs as JSON (own middleware) | ⬜ | |
@@ -73,6 +73,17 @@ Observed: Ctrl+C ~0.8 s into a 5 s request → `[GIN] 200 | 5s`, shutdown in 4.1
 ## 1.5 Only claim success on success
 
 After a failed `Shutdown`, `return` so "complete" isn't logged too. `return` in `main` still runs the `defer`s.
+
+## 1.6 Config from environment variables
+
+The same image runs in every environment; Kubernetes passes settings in as env vars (Deployment or ConfigMap).
+
+- Start from defaults, let each env var override, and **fail fast** on a value that is set but invalid.
+- `os.LookupEnv` says whether a variable is set at all: unset → default, `PORT=` → error. `os.Getenv` returns `""` for both. Either is a valid choice; LookupEnv is stricter.
+- `LoadConfig` returns `(Config, error)` and doesn't exit; main logs and calls `os.Exit(1)`. Load config after the logger so the error is JSON.
+- `Addr` needs the colon: `":" + strconv.Itoa(port)`. `"8080"` fails with `missing port in address`.
+
+Observed: `SHUTDOWN_TIMEOUT=abc` → JSON error at startup. `PORT=9097 SHUTDOWN_TIMEOUT=2s` → 5 s request cut off at 2 s.
 
 ## 1.7 JSON logs with slog
 
