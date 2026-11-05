@@ -1,7 +1,7 @@
 package routes
 
 import (
-	"gcp-sess/handler"
+	"gcp-sess/api/handler"
 
 	"github.com/gin-gonic/gin"
 )

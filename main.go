@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"errors"
-	h "gcp-sess/handler"
-	"gcp-sess/middleware"
-	r "gcp-sess/routes"
+	h "gcp-sess/api/handler"
+	"gcp-sess/api/middleware"
+	r "gcp-sess/api/routes"
 	u "gcp-sess/utils"
 	"log/slog"
 	"net/http"
