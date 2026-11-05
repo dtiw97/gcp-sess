@@ -8,7 +8,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 |---|---|---|---|
 | 2.1 | WebSocket upgrade: `/ws` echo | ✅ | see `git log -- handler/ws.go` |
 | 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (actor) | see `git log room-actor` |
-| 2.3 | Tick: the room broadcasts state every 50 ms | ⬜ | |
+| 2.3 | Tick: a Sim actor advances state every 50 ms; the Room delivers it | ✅ (actor) | see `git log room-actor` |
 | 2.4 | Shutdown with live connections | ⬜ | |
 
 ## 2.1 WebSocket upgrade
@@ -74,3 +74,26 @@ Tested: 3 clients, A and B send, C leaves, A sends again → A and B get all thr
 |---|---|---|
 | 2.3 Tick | one more `case <-ticker.C:` in the same `select` | separate goroutine with a ticker; locks to read state and broadcast (tbm-sim's `broadcastLoop`) |
 | 2.4 Shutdown | `Run` needs a stop signal; after it stops, a readLoop's `r.leave <- c` hangs forever | stop the ticker goroutine, close clients under the lock |
+
+### 2.3 on this branch: Sim and Room, two actors
+
+Authoritative server: the server owns the state and advances it on a clock; clients send **commands** and display what comes back. With a tick, the tick **is** the broadcast: the old "relay to everyone" path is gone.
+
+```
+client ─readLoop─▶ Room.commands ─▶ Sim.commands   (IN: change the state)
+                                     Sim: tick every 50 ms
+client ◀writeLoop─ Room.sendAll  ◀─ Sim.output     (OUT: the computed state)
+```
+
+- **Sim** (`sim.go`) owns `State` and the ticker; knows nothing about clients. Mirrors tbm-sim's EPBSession.
+- **Room** (`room.go`) owns the client set; forwards commands, encodes each state as JSON once, fans it out, drops slow clients. Mirrors tbm-sim's Room.
+- Each actor owns its data; **channels are the only way data crosses**, so no locks.
+- `time.NewTicker(d)`: `ticker.C` is a channel that gets a value every `d`. `defer ticker.Stop()`.
+- The sim sends to `output` with `select`/`default`: it **never waits** on the Room. If the Room hasn't taken the last state, this one is skipped; a fresher one comes in 50 ms.
+- `output` has a buffer of 1 (newest state); `commands` a buffer of 64 (the Room hands over without waiting).
+- Sending a struct value sends a **copy**: the Room can't modify the sim's state.
+- Struct tags `` `json:"tick"` `` name the JSON fields. `json.Marshal` → `(data, err)`. `continue` skips to the next loop round.
+- Naming: `state` is the data, `output` the pipe. Avoid names that differ by one letter (`state`/`states`).
+- Trade-off to tune: 20 states/s with a send buffer of 16 drops a client that stalls for ~0.8 s.
+
+Tested: B gets 20 states/s, sees A's command on the next ticks, 0 skipped ticks, 0 races.

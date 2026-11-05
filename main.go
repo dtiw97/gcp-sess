@@ -44,8 +44,11 @@ func main() {
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
-	// One room per server, like tbm-sim (maxRooms=1). Run is the room's own goroutine.
-	room := session.NewRoom()
+	// One session per server, like tbm-sim (maxRooms=1): a Sim that ticks and a Room
+	// that delivers. Each Run is its own goroutine.
+	sim := session.NewSim()
+	go sim.Run()
+	room := session.NewRoom(sim)
 	go room.Run()
 
 	ws := h.NewWS(room)

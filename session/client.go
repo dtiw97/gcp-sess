@@ -42,7 +42,7 @@ func (c *Client) readLoop() {
 			slog.Info("ws disconnected", "remote", c.conn.RemoteAddr().String(), "err", err)
 			return
 		}
-		c.room.broadcast <- data // the room passes it to every client, including us
+		c.room.commands <- data // a command for the room; everyone sees its effect on the next tick
 	}
 }
 
