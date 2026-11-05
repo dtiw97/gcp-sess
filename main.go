@@ -43,7 +43,7 @@ func main() {
 		Handler: router,
 	}
 
-	// ! App Context detects SIGTERM for termination
+	// * App Context detects SIGTERM for termination
 	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -55,11 +55,14 @@ func main() {
 		}
 	}()
 	health.SetReady(true)
-	<-appCtx.Done() // Channels sleeps main thread until it receives from channel.
-	stop()          // Receives signal, proceed
-	health.SetReady(false)
 
-	// ! ShutDown context, sets a context of 10s
+	<-appCtx.Done()        // * Channels sleeps main thread until it receives from channel.
+	stop()                 // Receives signal, proceed
+	health.SetReady(false) // Returns 503, kube LB stop sending.
+	slog.Info("Draining", "delay", cfg.DrainDelay.String())
+	time.Sleep(cfg.DrainDelay) // * Drain Delay
+
+	// * ShutDown context, sets a context of ShutdownTimeout
 	shutDownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 

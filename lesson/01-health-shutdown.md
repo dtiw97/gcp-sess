@@ -13,7 +13,7 @@ Goal: a Go service that behaves well under Kubernetes. It says when it's ready, 
 | 1.5 | Fix: don't log "complete" after a timeout | ✅ | `0d867cf` |
 | 1.6 | Config from environment variables (PORT, SHUTDOWN_TIMEOUT) | ✅ | see `git log -- config.go` |
 | 1.7 | JSON logs with slog (our own lines) | ✅ | `0d867cf` |
-| 1.8 | DRAIN_DELAY: see `/readyz` answer 503 during shutdown | ⬜ | |
+| 1.8 | DRAIN_DELAY: see `/readyz` answer 503 during shutdown | ✅ | see `git log -- config.go` |
 | 1.9 | Gin request logs as JSON (own middleware) | ⬜ | |
 
 ## 1.2 Own `http.Server`
@@ -98,6 +98,24 @@ slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil))) // in loggers.Set
 - `slog.Error` only logs. `log.Fatal` used to exit too, so add `os.Exit(1)` yourself.
 - `time.Duration` is written as nanoseconds in JSON; use `.String()` for `"4.19s"`.
 - Gin's `[GIN]` request lines are still plain text (1.9).
+
+## 1.8 DRAIN_DELAY
+
+When a pod is deleted, Kubernetes sends SIGTERM **and** removes the pod from the Service endpoints at the same time. The removal takes a few seconds to reach kube-proxy and load balancers, so traffic keeps arriving. Closing the listener at once means those requests get "connection refused".
+
+```
+SIGTERM → stop() → SetReady(false) → log → sleep DRAIN_DELAY → Shutdown(SHUTDOWN_TIMEOUT)
+```
+
+- Announce first (`/readyz` 503), then wait while **still serving**, then close.
+- `stop()` before the sleep, so a second Ctrl+C still force-quits.
+- Log **before** sleeping, or the drain looks like a hang.
+- `time.Duration` is nanoseconds: a bare `5` means 5 ns. Write `5*time.Second`.
+- "At least 5s" is `d < 5*time.Second` → error. `<=` would reject 5s itself.
+- Budget: DRAIN_DELAY + SHUTDOWN_TIMEOUT < terminationGracePeriodSeconds (30 s).
+- Comments say what/why, not values: "sets a context of 10s" went stale once the value became configurable.
+
+Observed: 1 s after Ctrl+C, `/readyz` 503 and `/livez` 200. After 5 s the listener closed (curl `000`) and shutdown completed at once (nothing in flight).
 
 ## Concepts carried over from the first run
 
