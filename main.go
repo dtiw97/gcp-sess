@@ -43,6 +43,9 @@ func main() {
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
+	ws := h.NewWS()
+	r.WSRoutes(router, ws)
+
 	// Setup server
 	server := &http.Server{
 		Addr:    ":" + strconv.Itoa(cfg.Port),
