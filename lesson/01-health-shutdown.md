@@ -14,7 +14,7 @@ Goal: a Go service that behaves well under Kubernetes. It says when it's ready, 
 | 1.6 | Config from environment variables (PORT, SHUTDOWN_TIMEOUT) | ✅ | see `git log -- config.go` |
 | 1.7 | JSON logs with slog (our own lines) | ✅ | `0d867cf` |
 | 1.8 | DRAIN_DELAY: see `/readyz` answer 503 during shutdown | ✅ | see `git log -- config.go` |
-| 1.9 | Gin request logs as JSON (own middleware) | ⬜ | |
+| 1.9 | Gin request logs as JSON (own middleware) | ✅ | see `git log -- middleware` |
 
 ## 1.2 Own `http.Server`
 
@@ -116,6 +116,23 @@ SIGTERM → stop() → SetReady(false) → log → sleep DRAIN_DELAY → Shutdow
 - Comments say what/why, not values: "sets a context of 10s" went stale once the value became configurable.
 
 Observed: 1 s after Ctrl+C, `/readyz` 503 and `/livez` 200. After 5 s the listener closed (curl `000`) and shutdown completed at once (nothing in flight).
+
+## 1.9 Request logs as JSON
+
+`gin.Default()` = `gin.New()` + `gin.Logger()` (text `[GIN]` lines) + `gin.Recovery()` (panic → 500).
+Keep Recovery, swap Logger for our own middleware.
+
+```go
+func(c *gin.Context) {
+    start := time.Now() // before: request arrived
+    c.Next()            // run the rest of the chain
+    slog.Info("request", "status", c.Writer.Status(), "latency", time.Since(start).String(), ...)
+}
+```
+
+- Log **after** `c.Next()`: status and latency don't exist before the handler runs.
+- `RequestLogger()` returns the middleware (same shape as `gin.Logger()`), leaving room for options.
+- The `[GIN-debug]` startup lines are debug mode, not request logs. `GIN_MODE=release` removes them.
 
 ## Concepts carried over from the first run
 

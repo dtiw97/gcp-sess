@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	h "gcp-sess/handler"
+	"gcp-sess/middleware"
 	r "gcp-sess/routes"
 	u "gcp-sess/utils"
 	"log/slog"
@@ -24,7 +25,12 @@ func main() {
 		slog.Error("invalid config", "err", err)
 		os.Exit(1)
 	}
-	router := gin.Default()
+	// gin.New() instead of gin.Default(): keep Recovery, swap Gin's text Logger for our JSON one.
+	router := gin.New()
+	router.Use(
+		gin.Recovery(),
+		middleware.RequestLogger())
+
 	router.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Second) // simulate a slow in-flight request, to test shutdown later
 		// To simulate case A, where request takes longer than required to shutdown.
