@@ -5,7 +5,8 @@ import (
 	"errors"
 	"gcp-sess/handler"
 	"gcp-sess/routes"
-	"log"
+	"gcp-sess/utils/loggers"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 )
 
 func main() {
+	loggers.Setup()
 	router := gin.Default()
 	router.GET("/", func(c *gin.Context) {
 		time.Sleep(5 * time.Second) // simulate a slow in-flight request, to test shutdown later
@@ -42,7 +44,8 @@ func main() {
 	go func() {
 		// Serve Server
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+			slog.Error("serving failed", "addr", server.Addr, "err", err)
+			os.Exit(1)
 		}
 	}()
 	health.SetReady(true)
@@ -62,13 +65,13 @@ func main() {
 	if err := server.Shutdown(shutDownCtx); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			// case A: hit 10s, requests still running → they get cut off
-			log.Printf("Shutdown Timed out after %s, active requests were cut off.",
-				time.Since(start))
+			slog.Warn("shutdown timed out, active requests cut off", "after", time.Since(start).String())
 		} else {
 			// case B: some other failure (rare, eg: closing the listener failed)
-			log.Printf("Shutdown failed after %s: %v", time.Since(start), err)
+			slog.Error("shutdown failed", "after", time.Since(start).String(), "err", err)
 		}
+		return // don't fall through to "complete": requests were not all finished
 	}
 
-	log.Printf("Server shut down complete at %s", time.Since(start))
+	slog.Info("server shut down complete", "after", time.Since(start).String())
 }
