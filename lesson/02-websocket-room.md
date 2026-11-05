@@ -36,3 +36,12 @@ Testing:
 - Plain `curl` or the address bar → **400**: a normal GET has no upgrade headers.
 - curl with the headers shows the 101, but can't speak frames. The key must decode to exactly 16 bytes (`dGhlIHNhbXBsZSBub25jZQ==`), or it's a 400 too. **Check the server log** for the reason.
 - Browser: open `http://localhost:8080/livez`, then in the console `ws = new WebSocket("ws://localhost:8080/ws"); ws.onmessage = e => console.log(e.data); ws.send("hi")`.
+
+## Branch `room-actor`: the channel (actor) Room
+
+This branch explores the alternative to `main`'s mutex Room: only `Room.Run` touches the client set, and everyone else talks to it through `join` / `leave` / `broadcast` channels inside one `select`. No mutex, because one goroutine owns the map.
+
+- Go maps crash on concurrent writes (`fatal error: concurrent map writes`): many readLoops and handlers run in their own goroutines, so the map needs either a lock or a single owner.
+- `map[*Client]struct{}` is a set: unique keys, and the empty struct takes no memory.
+- Risk: a send to a room whose `Run` has stopped blocks forever.
+- See the trade-off table on `main` in this file.
