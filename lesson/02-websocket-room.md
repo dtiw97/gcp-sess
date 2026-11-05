@@ -7,7 +7,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 | # | Lesson | Status | Commit |
 |---|---|---|---|
 | 2.1 | WebSocket upgrade: `/ws` echo | ✅ | see `git log -- handler/ws.go` |
-| 2.2 | Room: many clients, one broadcast; read and write loops per client | ⬜ | |
+| 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (actor) | see `git log room-actor` |
 | 2.3 | Tick: the room broadcasts state every 50 ms | ⬜ | |
 | 2.4 | Shutdown with live connections | ⬜ | |
 
@@ -45,3 +45,32 @@ This branch explores the alternative to `main`'s mutex Room: only `Room.Run` tou
 - `map[*Client]struct{}` is a set: unique keys, and the empty struct takes no memory.
 - Risk: a send to a room whose `Run` has stopped blocks forever.
 - See the trade-off table on `main` in this file.
+
+### 2.2 on this branch
+
+```go
+case msg := <-r.broadcast:
+	for c := range r.clients {      // range over a map: each key (a client)
+		select {
+		case c.send <- msg:         // room in c's buffer: queued
+		default:                    // buffer full: drop the slow client, never wait
+			delete(r.clients, c)    // deleting during range is allowed
+			close(c.send)
+		}
+	}
+```
+
+- `case c := <-r.join:` — `:=` declares `c` right there; its type comes from the channel (`chan *Client` → `*Client`). It exists only inside that case.
+- `_, ok := r.clients[c]` — a map lookup can return two values: the stored value and a `bool` "was the key found?". The map stores no bools; Go computes it during the lookup. `_` throws away a slot you don't need.
+- Leave checks `ok` before `close`, because broadcast may already have dropped the client, and closing a channel twice panics.
+- Only the **sender** closes a channel. The room sends on `c.send`, so the room closes it; that ends writeLoop's `range`.
+- `Room.Serve(conn)`: join, `go writeLoop()`, `readLoop()`. Lowercase names (`join`, `readLoop`) are private to the package; capitalised ones (`Serve`, `Run`) are exported. The handler only gets the public door.
+
+Tested: 3 clients, A and B send, C leaves, A sends again → A and B get all three, C the first two. `-race`: 0 data races.
+
+### What differs in 2.3 and 2.4
+
+| | Actor (this branch) | Mutex (`main`) |
+|---|---|---|
+| 2.3 Tick | one more `case <-ticker.C:` in the same `select` | separate goroutine with a ticker; locks to read state and broadcast (tbm-sim's `broadcastLoop`) |
+| 2.4 Shutdown | `Run` needs a stop signal; after it stops, a readLoop's `r.leave <- c` hangs forever | stop the ticker goroutine, close clients under the lock |

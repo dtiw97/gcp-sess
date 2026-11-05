@@ -1,5 +1,7 @@
 package session
 
+import "github.com/gorilla/websocket"
+
 // Room is one session: a set of clients that see each other's messages.
 // Only the Run goroutine touches clients; everyone else talks to it through
 // the channels below, so the map needs no mutex.
@@ -25,24 +27,39 @@ func NewRoom() *Room {
 func (r *Room) Run() {
 	for {
 		select {
-		case c := <-r.join:
-			_ = c
-			// TODO(you): add c to r.clients
+		case newClient := <-r.join:
+			r.clients[newClient] = struct{}{} // add to the set; only this goroutine touches the map
 
-		case c := <-r.leave:
-			_ = c
-			// TODO(you):
-			//   1. if c is still in r.clients: delete it, then close(c.send)
-			//      (closing ends c's writeLoop; check first so we never close twice)
+		case removeClient := <-r.leave:
+			// Broadcast may have dropped this client already (too slow), and closing
+			// a channel twice panics. So only act if it's still in the set.
+			// ! (value, bool) = when declaring against map[]
+			_, ok := r.clients[removeClient]
+			if ok {
+				delete(r.clients, removeClient) // ! go's built in command to delete from maps[].
+				close(removeClient.send)        // ! go's built-in command to close a chan[].
+			}
 
 		case msg := <-r.broadcast:
-			_ = msg
-			// TODO(you): for each client c in r.clients:
-			//   select {
-			//   case c.send <- msg: // queued
-			//   default:            // c.send is full: client too slow, drop it
-			//       delete it from r.clients and close(c.send)
-			//   }
+			// ! range over a map gives each key; here each key is a client.
+			for c := range r.clients {
+				// ! select with default: try the send, but never wait.
+				select {
+				case c.send <- msg: // room in c's buffer: queued for its writeLoop
+				default: // buffer full: c is too slow, drop it instead of stalling everyone
+					delete(r.clients, c) // ! deleting inside range over a map is allowed in Go
+					close(c.send)
+				}
+			}
 		}
 	}
+}
+
+// Serve runs one WebSocket connection inside the room until it disconnects.
+// The HTTP handler calls it after the upgrade, so the handler needs no session internals.
+func (r *Room) Serve(conn *websocket.Conn) {
+	c := NewClient(r, conn)
+	r.join <- c      // hand the new client to Run; waits until Run has taken it
+	go c.writeLoop() // writing: its own new goroutine
+	c.readLoop()     // reading: this (the handler's) goroutine, until the client leaves
 }

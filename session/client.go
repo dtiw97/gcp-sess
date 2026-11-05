@@ -11,18 +11,16 @@ import (
 const sendBuffer = 16
 
 // Client is one WebSocket connection in a room.
-// Whoever starts it runs readLoop and writeLoop, each in its own goroutine:
-//
-//	go client.writeLoop()
-//	client.readLoop()
+// Room.Serve starts it: writeLoop in a new goroutine, readLoop in the current one.
 type Client struct {
+	room *Room // the room this client belongs to: where readLoop sends messages and "I left"
 	conn *websocket.Conn
 	send chan []byte // outgoing messages; the room puts them in, writeLoop takes them out
-	// TODO(2.2): room *Room
 }
 
-func NewClient(conn *websocket.Conn) *Client {
+func NewClient(room *Room, conn *websocket.Conn) *Client {
 	return &Client{
+		room: room,
 		conn: conn,
 		send: make(chan []byte, sendBuffer),
 	}
@@ -33,7 +31,7 @@ func NewClient(conn *websocket.Conn) *Client {
 func (c *Client) readLoop() {
 	// Registered first, so cleanup happens however the loop ends.
 	defer func() {
-		// TODO(2.2): c.room.leave <- c  (the room then closes c.send, which ends writeLoop)
+		c.room.leave <- c // the room removes us and closes c.send, which ends writeLoop
 		c.conn.Close()
 	}()
 
@@ -44,7 +42,7 @@ func (c *Client) readLoop() {
 			slog.Info("ws disconnected", "remote", c.conn.RemoteAddr().String(), "err", err)
 			return
 		}
-		_ = data // TODO(2.2): c.room.broadcast <- data
+		c.room.broadcast <- data // the room passes it to every client, including us
 	}
 }
 

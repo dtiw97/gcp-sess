@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"gcp-sess/session"
 	"log/slog"
 
 	"github.com/gin-gonic/gin"
@@ -9,36 +10,26 @@ import (
 
 type WS struct {
 	upgrader websocket.Upgrader
+	room     *session.Room // every connection joins this one room
 }
 
-func NewWS() *WS {
+func NewWS(room *session.Room) *WS {
 	return &WS{
 		upgrader: websocket.Upgrader{},
+		room:     room,
 	}
 }
 
+// Serve does the HTTP part (the upgrade), then hands the connection to the room.
 func (h *WS) Serve(c *gin.Context) {
 	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil { // error check
 		slog.Warn("websocket upgrade failed", "err", err)
-		return // conn is nil here; without return, conn.Close() below panics
+		return // conn is nil here, so there is nothing to hand over
 	}
-	defer conn.Close() // cleanup.
 
 	slog.Info("ws connected", "client_ip", c.ClientIP())
 
-	// Echo loop: one goroutine both reads and writes. Fine for echo, because we
-	// only write in reply to a read. The room (2.2) needs separate read and write loops.
-	for {
-		msgType, data, err := conn.ReadMessage() // blocks until the client sends something
-		if err != nil {
-			// Client closed the tab, sent a close frame, or the connection broke.
-			slog.Info("ws disconnected", "client_ip", c.ClientIP(), "err", err)
-			return
-		}
-		if err := conn.WriteMessage(msgType, data); err != nil {
-			slog.Info("ws write failed", "client_ip", c.ClientIP(), "err", err)
-			return
-		}
-	}
+	// Blocks until this client disconnects; the client's own loops close the conn.
+	h.room.Serve(conn)
 }
