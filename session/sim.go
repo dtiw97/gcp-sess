@@ -1,6 +1,10 @@
 package session
 
-import "time"
+import (
+	"context"
+	"log/slog"
+	"time"
+)
 
 // tickInterval is how often the sim advances its state (tbm-sim: 50 ms).
 const tickInterval = 50 * time.Millisecond
@@ -31,14 +35,21 @@ func NewSim() *Sim {
 	}
 }
 
-// Run is the sim's own goroutine: main starts it once with `go sim.Run()`.
-func (s *Sim) Run() {
+// Run is the sim's own goroutine: main starts it once with `wg.Go(func() { sim.Run(sessCtx) })`.
+// It returns when ctx is cancelled.
+func (s *Sim) Run(ctx context.Context) {
 	// ! ticker.C is a channel; Go puts a value in it every tickInterval.
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop() // turn the timer off when Run returns
 
 	for {
 		select {
+		case <-ctx.Done():
+			// ! Done() is a channel that gets closed on cancel; a closed channel never blocks.
+			// Last chance to save state (tbm-sim would persist here).
+			slog.Info("sim stopped", "tick", s.state.Tick)
+			return // ! ends Run itself, not just the select; defer then stops the ticker
+
 		case cmd := <-s.commands:
 			// Change the state only. It goes out with the next tick.
 			s.state.Last = string(cmd) // ! []byte → string conversion

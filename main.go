@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,12 +45,22 @@ func main() {
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
+	// * Session context: NOT appCtx. The session must keep running through the drain,
+	// so main cancels it itself with stopSession(), after server.Shutdown.
+	sessCtx, stopSession := context.WithCancel(context.Background())
+	defer stopSession() // safety net for early returns; the normal path calls it explicitly
+
 	// One session per server, like tbm-sim (maxRooms=1): a Sim that ticks and a Room
 	// that delivers. Each Run is its own goroutine.
 	sim := session.NewSim()
-	go sim.Run()
 	room := session.NewRoom(sim)
-	go room.Run()
+
+	// * WaitGroup: a counter so main can wait for the actors before exiting.
+	// ! wg.Go = Add(1) + start the goroutine + Done() when the function returns.
+	// ! func() { ... } is an anonymous function: wg.Go wants a func() with no arguments.
+	var wg sync.WaitGroup               // ! zero value = counter at 0, ready to use
+	wg.Go(func() { sim.Run(sessCtx) })  // counter 1
+	wg.Go(func() { room.Run(sessCtx) }) // counter 2
 
 	ws := h.NewWS(room)
 	r.WSRoutes(router, ws)
@@ -100,4 +111,10 @@ func main() {
 	}
 
 	slog.Info("server shut down complete", "after", time.Since(start).String())
+
+	// * No new connections now: stop the session. Closes sessCtx.Done(), so Room.Run
+	// (closes clients with 1001) and Sim.Run return.
+	stopSession()
+	wg.Wait() // * blocks until both Run functions return (counter back to 0); then main may exit
+	slog.Info("session stopped")
 }

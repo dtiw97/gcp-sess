@@ -9,7 +9,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 | 2.1 | WebSocket upgrade: `/ws` echo | ✅ | see `git log -- handler/ws.go` |
 | 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (actor) | see `git log room-actor` |
 | 2.3 | Tick: a Sim actor advances state every 50 ms; the Room delivers it | ✅ (actor) | see `git log room-actor` |
-| 2.4 | Shutdown with live connections | ⬜ | |
+| 2.4 | Shutdown with live connections: clients get 1001, actors stop, nothing leaks | ✅ (actor) | see `git log room-actor` |
 
 ## 2.1 WebSocket upgrade
 
@@ -35,7 +35,7 @@ server: 101 Switching Protocols
 Testing:
 - Plain `curl` or the address bar → **400**: a normal GET has no upgrade headers.
 - curl with the headers shows the 101, but can't speak frames. The key must decode to exactly 16 bytes (`dGhlIHNhbXBsZSBub25jZQ==`), or it's a 400 too. **Check the server log** for the reason.
-- Browser: open `http://localhost:8080/livez`, then in the console `ws = new WebSocket("ws://localhost:8080/ws"); ws.onmessage = e => console.log(e.data); ws.send("hi")`.
+- Browser: open `http://localhost:8080/x` (a plain-text 404; Firefox's JSON viewer on `/livez` blocks WebSockets with its `default-src 'none'` policy), then in the console `ws = new WebSocket("ws://localhost:8080/ws"); ws.onmessage = e => console.log(e.data); ws.send("hi")`.
 
 ## Branch `room-actor`: the channel (actor) Room
 
@@ -97,3 +97,50 @@ client ◀writeLoop─ Room.sendAll  ◀─ Sim.output     (OUT: the computed st
 - Trade-off to tune: 20 states/s with a send buffer of 16 drops a client that stalls for ~0.8 s.
 
 Tested: B gets 20 states/s, sees A's command on the next ticks, 0 skipped ticks, 0 races.
+
+### 2.4 on this branch: shutdown with live connections
+
+Before: Ctrl+C → the client got states through the drain, then **1006** (abnormal). `server.Shutdown` returned in ~90µs because it doesn't track hijacked WebSocket conns, and Sim/Room had no way to stop.
+
+After:
+
+```
+SIGTERM → readiness 503 → drain → server.Shutdown (no new connections)
+  → stopSession() → Room: drop every client (1001 close frame), wait for their writeLoops
+                  → Sim: last chance to save state
+  → wg.Wait() → exit
+```
+
+**Contexts.** `context.Background()` is an empty root, never cancelled, knows nothing. The wrappers attach the "who cancels me" rule:
+
+```
+context.Background()
+ ├── appCtx       (NotifyContext)  ← the OS signal
+ ├── sessCtx      (WithCancel)     ← main, via stopSession()
+ └── shutDownCtx  (WithTimeout)    ← a timer
+```
+
+- Cancelling a parent cancels its children, never the reverse. `WithCancel(appCtx)` would freeze the session at SIGTERM, during the drain.
+- `ctx.Done()` is a channel that gets **closed** on cancel. A closed channel never blocks, so every waiter wakes at once (a broadcast).
+- `case <-ctx.Done(): ... return`. `return` ends `Run`. **`break` inside a `select` only leaves the `select`**, so the `for` would go round again.
+
+**main must wait.** When `main` returns, every goroutine dies. `sync.WaitGroup` is a counter: `wg.Go(f)` = Add(1) + `go f` + Done() when `f` returns; `wg.Wait()` blocks until 0. `func() { sim.Run(sessCtx) }` is an anonymous function, because `wg.Go` wants a `func()` with no arguments.
+
+**Waiting for the Sim and Room isn't enough.** The close frame is written by each client's writeLoop, a different goroutine. Experiment: waiting only for Sim and Room gave 1001 **once in 3 runs** (a race). Each Client got a `done` channel, closed by writeLoop's first defer (defers run in reverse, so it's closed last, after `conn.Close()`). The Room drops **everyone first**, then waits for each `done`: all close frames go out in parallel, so the total is about the slowest client. After: 1001 in 5 out of 5.
+
+**Sending to a stopped actor hangs.** After `Run` returns, readLoop's `c.room.leave <- c` has no receiver and waits forever (a leaked goroutine; invisible from outside, found with a goroutine dump). Fix: `Room.done`, closed by `defer close(r.done)` in `Run`, and **every send to the Room** (`join`, `leave`, `commands`) becomes:
+
+```go
+select {
+case c.room.leave <- c: // room running
+case <-c.room.done:     // room stopped: give up
+}
+```
+
+The `ok` check in Run's `leave` case is the other end of that channel and solves a different problem (closing `c.send` twice).
+
+- A `chan` field's zero value is `nil`. `close(nil)` panics; `<-nil` blocks forever. Always `make` it.
+- Close code: an empty close body shows as **1005**. `websocket.FormatCloseMessage(websocket.CloseGoingAway, "server shutting down")` → **1001**. (Slow clients dropped by `sendAll` get it too: fine for now.)
+- "sim stopped" and "room stopped" can log in either order: both wake on the same `sessCtx`.
+
+Tested (`-race`, 5 runs): server logs `server shut down complete → room stopped / sim stopped → session stopped`; the client gets `1001 "server shutting down" wasClean=true`; goroutine dump: 0 stuck readLoops (before 2b: 1).
