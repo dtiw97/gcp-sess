@@ -6,6 +6,7 @@ import (
 	h "gcp-sess/api/handler"
 	"gcp-sess/api/middleware"
 	r "gcp-sess/api/routes"
+	"gcp-sess/session"
 	u "gcp-sess/utils"
 	"log/slog"
 	"net/http"
@@ -43,7 +44,10 @@ func main() {
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
-	ws := h.NewWS()
+	// One room for the whole server (tbm-sim: maxRooms=1). No goroutine to start:
+	// a mutex Room is just data plus a lock; callers do the work.
+	room := session.NewRoom()
+	ws := h.NewWS(room)
 	r.WSRoutes(router, ws)
 
 	// Setup server
