@@ -8,7 +8,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 |---|---|---|---|
 | 2.1 | WebSocket upgrade: `/ws` echo | ✅ | see `git log -- handler/ws.go` |
 | 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (mutex) | see `git log -- session/room.go` |
-| 2.3 | Tick: the room broadcasts state every 50 ms | ⬜ | |
+| 2.3 | Tick: a machine model, an engine that runs it, a tick loop that broadcasts | ✅ (mutex) | see `git log -- machine/` |
 | 2.4 | Shutdown with live connections | ⬜ | |
 
 ## 2.1 WebSocket upgrade
@@ -87,6 +87,49 @@ readLoop: each message → r.Broadcast(data);  on exit → r.Leave(c)
 **Timing.** Each client has 2 goroutines (cheap). Different send times are fine: the lock orders them. Different network speeds are fine: own writeLoop, drop when the buffer is full. Who decides the *game* state when inputs arrive at different times is 2.3's tick.
 
 Tested: 3 clients, A sends `a1`, B `b1`, C leaves, A `a2` → A and B `[a1 b1 a2]`, C `[a1 b1]`; `-race`: 0 data races.
+
+### 2.3 on `main`: machine, engine, tick loop
+
+Authoritative server: clients send **inputs**, the server computes, and the tick is the only broadcast.
+
+```
+IN:  client ─▶ readLoop: json.Unmarshal → engine.Apply(input)      (stores it; nothing computed)
+     tick loop, every 50 ms (go room.Run()):
+       state := engine.Step(50ms)    engine lock on/off, returns a copy
+       data  := json.Marshal(state)  no lock
+       room.Broadcast(data)          room lock on/off
+OUT: client ◀─ writeLoop ◀─ c.send
+```
+
+Three layers, three homes:
+
+| Layer | Where | Knows about |
+|---|---|---|
+| the machine (model) | `machine/state.go`, package `machine` | input + time → output. Pure: `func (st State) Run(in Input, dt time.Duration) State` |
+| runs the machine | `session/engine.go`, `Engine` | the one live State, the latest input, the tick count, its mutex |
+| the clients | `session/room.go`, `Room` | the client set, `Broadcast`, the tick loop `Run` |
+
+- `session` imports `machine`, never the reverse; Go forbids import cycles, so the compiler enforces it. `machine` is testable with no server: `State{}.Run(Input{PottyValue: 200}, 50*time.Millisecond)`.
+- **Time is a parameter.** `dt time.Duration`; `dt.Seconds()` → float64 (50 ms → 0.05). An `int` of seconds turns 50 ms into 0. `+=` makes it stateful (distance accumulates).
+- **Value receiver = pure.** `st` is a copy; `Run` returns the new State, the engine stores it.
+- **Input persists**, like a real pot: no new input → the machine keeps running on the last one. Last write in a tick wins; it takes effect on the next tick, for everyone.
+- The tick count lives in the Engine (bookkeeping), not in the State. Clients don't need it: TCP keeps order, and a slow client is disconnected, never skipped, so the latest full state is enough. (Sending diffs, or skipping states, would need a sequence number.)
+
+**Why `go room.Run()`.** Defining a method doesn't start it. `Run` loops forever (`for range ticker.C`: once per tick; a ticker's channel is never closed), so without `go` main would stop there and never serve. And ticking needs a goroutine of its own: Join/Leave/Broadcast borrow a client's goroutine, but the machine must advance when nobody sends anything. A ticker holds it to real time; a bare `for {}` would run millions of steps a second.
+
+**Two mutexes, never held together.** `Room.mu` guards the client set; `Engine.mu` guards input/state/tick. The engine is shared by every readLoop (`Apply` writes `input`) and the tick loop (`Step` reads `input`, writes `state`). writeLoops never touch it. The tick loop releases the engine's lock before taking the room's, so no lock-ordering deadlock.
+
+**Why `Step` returns a copy.** The tick loop encodes `state` after `Step` has unlocked. A pointer to the engine's state would be read unlocked while the next `Step` writes it: a data race, and maybe a half-old, half-new frame.
+
+**`json.Unmarshal(data, &input)`**: bytes → struct; `&` so it fills *our* variable. Bad JSON → log, `continue`, keep the connection and the last good input.
+
+**Bug found:** readLoop still called `c.room.Broadcast(data)` from 2.2, so every input was relayed raw alongside the states (29 messages, 1 not a state). Clients expecting only states would break, and they'd see inputs before the server applied them. In 2.3 the tick loop is the only sender.
+
+**Dummy frontend:** `web/index.html` (React from a CDN, no build), served at `http://localhost:8080/ui` by `router.StaticFile`. It must be served by this server: the Upgrader rejects other origins, so `file://` or a dev server on another port gets 403. Slider → `{"potty_value": N}`; cards show speed, distance, the server's input, states/s (~20).
+
+**Deferred requirement (tbm-sim):** many commands in one envelope `{command: {group, action, args}}`; group `session` (start/pause/reset) → run state; group `tbm` → a command registry mutating the persistent control panel; gates before a command lands (paused → drop tbm commands). Paused = clock frozen, frames still broadcast.
+
+Tested: pot 100 for ~1.2 s → `{"input":{"potty_value":100},"output":{"speed":10,"distance":12}}`; 29 messages, all states; "not json" logged as bad input, connection kept; `-race`: 0.
 
 ### tbm-sim design note (for later)
 

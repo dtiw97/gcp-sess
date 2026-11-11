@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TBM Dummy Console</title>
+  <!-- Dummy frontend: React from a CDN + in-browser JSX (no build step). Not for production. -->
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+  <style>
+    :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --ok:#15803d; --bad:#b91c1c; --line:#e5e7eb; --accent:#2563eb; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#0f1115; --card:#181b22; --fg:#e6e8ee; --muted:#9aa1ad; --ok:#4ade80; --bad:#f87171; --line:#2a2f3a; --accent:#60a5fa; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+    main { max-width:640px; margin:32px auto; padding:0 16px; }
+    h1 { font-size:20px; margin:0 0 16px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+    .row { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+    .label { color:var(--muted); font-size:13px; }
+    .big { font-size:28px; font-variant-numeric:tabular-nums; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    input[type=range] { width:100%; accent-color:var(--accent); }
+    button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; }
+    pre { margin:0; font-size:12px; white-space:pre-wrap; word-break:break-all; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useEffect, useRef, useState } = React;
+
+    // Same host as the page, so the Upgrader's origin check passes.
+    const WS_URL = `ws://${location.host}/ws`;
+
+    function App() {
+      const wsRef = useRef(null);
+      const [status, setStatus] = useState("connecting"); // connecting | open | closed
+      const [closeInfo, setCloseInfo] = useState("");
+      const [pot, setPot] = useState(0);
+      const [state, setState] = useState(null); // latest machine.State from the server
+      const [rate, setRate] = useState(0);      // states received per second
+      const countRef = useRef(0);
+
+      function connect() {
+        setStatus("connecting");
+        setCloseInfo("");
+        const ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+        ws.onopen = () => setStatus("open");
+        ws.onmessage = (e) => {
+          let msg;
+          try { msg = JSON.parse(e.data); } catch { return; }
+          if (!msg.output) return; // not a machine state (e.g. a relayed raw input)
+          countRef.current++;
+          setState(msg);
+        };
+        ws.onclose = (e) => {
+          setStatus("closed");
+          setCloseInfo(`code ${e.code}${e.reason ? ` "${e.reason}"` : ""}, clean=${e.wasClean}`);
+        };
+      }
+
+      useEffect(() => {
+        connect();
+        const t = setInterval(() => { setRate(countRef.current); countRef.current = 0; }, 1000);
+        return () => { clearInterval(t); wsRef.current?.close(); };
+      }, []);
+
+      // Send the pot position as a machine.Input. The server applies it on the next tick.
+      function onPot(e) {
+        const v = Number(e.target.value);
+        setPot(v);
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ potty_value: v }));
+        }
+      }
+
+      const color = status === "open" ? "var(--ok)" : status === "closed" ? "var(--bad)" : "var(--muted)";
+      const out = state?.output;
+
+      return (
+        <main>
+          <h1>TBM dummy console</h1>
+
+          <div className="card row">
+            <div><span className="dot" style={{ background: color }} />{status} <span className="label">{WS_URL}</span></div>
+            {status === "closed" && <button onClick={connect}>Reconnect</button>}
+          </div>
+          {closeInfo && <div className="card label">Closed: {closeInfo}</div>}
+
+          <div className="card">
+            <div className="row"><span>Speed pot (potty_value)</span><span className="big">{pot}</span></div>
+            <input type="range" min="0" max="100" step="1" value={pot} onChange={onPot} disabled={status !== "open"} />
+            <div className="label">Sent as {"{"}"potty_value": {pot}{"}"}; the server applies it on the next 50 ms tick.</div>
+          </div>
+
+          <div className="card grid">
+            <div><div className="label">Speed (mm/s)</div><div className="big">{out ? out.speed.toFixed(1) : "–"}</div></div>
+            <div><div className="label">Distance (mm)</div><div className="big">{out ? out.distance.toFixed(1) : "–"}</div></div>
+            <div><div className="label">Server's input</div><div className="big">{state ? state.input.potty_value : "–"}</div></div>
+            <div><div className="label">States / second</div><div className="big">{rate}</div></div>
+          </div>
+
+          <div className="card">
+            <div className="label">Last state (raw)</div>
+            <pre>{state ? JSON.stringify(state) : "waiting…"}</pre>
+          </div>
+        </main>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

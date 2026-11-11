@@ -1,6 +1,8 @@
 package session
 
 import (
+	"encoding/json"
+	"gcp-sess/machine"
 	"log/slog"
 
 	"github.com/gorilla/websocket"
@@ -13,7 +15,7 @@ const sendBuffer = 16
 // Client is one WebSocket connection in a room.
 // Room.Serve starts it: writeLoop in a new goroutine, readLoop in the current one.
 type Client struct {
-	room *Room // the shared room this client is in: readLoop calls its Broadcast and Leave
+	room *Room // the shared room this client is in: readLoop calls room.engine.Apply and room.Leave
 	conn *websocket.Conn
 	send chan []byte // outgoing messages; the room puts them in, writeLoop takes them out
 }
@@ -27,10 +29,12 @@ func NewClient(room *Room, conn *websocket.Conn) *Client {
 	}
 }
 
-// readLoop takes messages from the browser and hands them to the room.
+// readLoop takes inputs from the browser and hands them to the engine.
+// It never broadcasts: the tick loop is the only thing that sends to clients.
 // It runs until the browser leaves or the connection breaks.
 func (c *Client) readLoop() {
 	// Registered first, so cleanup happens however the loop ends.
+
 	defer func() {
 		c.room.Leave(c) // the room removes us and closes c.send, which ends writeLoop
 		c.conn.Close()
@@ -43,7 +47,15 @@ func (c *Client) readLoop() {
 			slog.Info("ws disconnected", "remote", c.conn.RemoteAddr().String(), "err", err)
 			return
 		}
-		c.room.Broadcast(data) // a plain method call: it locks, queues for everyone, returns
+
+		// ! JSON bytes → struct. &input: a pointer, so Unmarshal fills OUR variable.
+		var input machine.Input
+		if err := json.Unmarshal(data, &input); err != nil {
+			// One bad message isn't a reason to disconnect: log, skip, keep the last good input.
+			slog.Warn("bad input", "remote", c.conn.RemoteAddr().String(), "err", err)
+			continue
+		}
+		c.room.engine.Apply(input) // IN: takes effect on the next tick, for everyone
 	}
 }
 

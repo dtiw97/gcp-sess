@@ -1,22 +1,27 @@
 package session
 
 import (
+	"encoding/json"
+	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// Room is one session: a set of clients that see each other's messages.
-// Many goroutines call its methods at once (each handler, each readLoop),
+// Room is one session: a set of clients that all receive the machine's state each tick.
+// Many goroutines call its methods at once (each handler, each readLoop, the tick loop),
 // so every access to clients happens while holding mu.
 type Room struct {
 	mu      sync.Mutex
 	clients map[*Client]struct{} // a set: we only care whether a client is in it
+	engine  *Engine
 }
 
-func NewRoom() *Room {
+func NewRoom(engine *Engine) *Room {
 	return &Room{
 		clients: make(map[*Client]struct{}),
+		engine:  engine,
 	}
 }
 
@@ -28,6 +33,29 @@ func (r *Room) Serve(conn *websocket.Conn) {
 	r.Join(c)               // add to the set first, so the first Broadcast already reaches c
 	go c.writeLoop()        // writing: its own new goroutine
 	c.readLoop()            // reading: this (the handler's) goroutine, until the client leaves
+}
+
+// Run is the tick loop (tbm-sim's broadcastLoop): main starts it once with `go room.Run()`.
+// Every tickInterval it steps the machine and sends the new state to every client.
+// It never returns (2.4 adds a way to stop it).
+func (r *Room) Run() {
+	// ! ticker.C is a channel; Go puts a value in it every tickInterval, forever.
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop() // turn the timer off when Run returns
+
+	// ! range over a channel: run the body once per value; a ticker's channel is
+	// never closed, so this loops for the life of the server.
+	for range ticker.C {
+		// Two locks, never held together: engine's in Step, room's in Broadcast.
+		// So no lock-ordering deadlock is possible.
+		state := r.engine.Step(tickInterval) // engine lock on/off; returns a copy
+		data, err := json.Marshal(state)     // no lock held: state is our own copy
+		if err != nil {
+			slog.Error("encode state failed", "err", err)
+			continue // ! skip to the next tick; nothing to send
+		}
+		r.Broadcast(data) // room lock on/off; encoded once, same bytes to everyone
+	}
 }
 
 // Join adds a client. Called by Serve.
@@ -55,7 +83,7 @@ func (r *Room) Leave(c *Client) {
 	}
 }
 
-// Broadcast queues msg for every client. Called by readLoop for each message.
+// Broadcast queues msg for every client. Called by the tick loop (Run) each tick.
 // It never waits on a client: the lock must only be held for quick work.
 func (r *Room) Broadcast(msg []byte) {
 	r.mu.Lock()

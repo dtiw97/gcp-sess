@@ -44,11 +44,18 @@ func main() {
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
-	// One room for the whole server (tbm-sim: maxRooms=1). No goroutine to start:
-	// a mutex Room is just data plus a lock; callers do the work.
-	room := session.NewRoom()
+	// One session for the whole server (tbm-sim: maxRooms=1): the engine runs the
+	// machine, the room delivers its state. go room.Run() starts the tick loop, the
+	// room's one goroutine: it must wake every 50 ms even when no client sends anything.
+	engine := session.NewEngine()
+	room := session.NewRoom(engine)
+	go room.Run()
 	ws := h.NewWS(room)
 	r.WSRoutes(router, ws)
+
+	// Dummy frontend (web/index.html): served from this server so the page's origin
+	// matches /ws, which the Upgrader requires. Open http://localhost:8080/ui
+	router.StaticFile("/ui", "./web/index.html")
 
 	// Setup server
 	server := &http.Server{
