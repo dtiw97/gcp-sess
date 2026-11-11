@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -35,27 +36,31 @@ func (r *Room) Serve(conn *websocket.Conn) {
 	c.readLoop()            // reading: this (the handler's) goroutine, until the client leaves
 }
 
-// Run is the tick loop (tbm-sim's broadcastLoop): main starts it once with `go room.Run()`.
-// Every tickInterval it steps the machine and sends the new state to every client.
-// It never returns (2.4 adds a way to stop it).
-func (r *Room) Run() {
+// Run is the tick loop: each tick it steps the machine and broadcasts; returns when ctx is cancelled.
+func (r *Room) Run(ctx context.Context) {
 	// ! ticker.C is a channel; Go puts a value in it every tickInterval, forever.
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop() // turn the timer off when Run returns
 
-	// ! range over a channel: run the body once per value; a ticker's channel is
-	// never closed, so this loops for the life of the server.
-	for range ticker.C {
-		// Two locks, never held together: engine's in Step, room's in Broadcast.
-		// So no lock-ordering deadlock is possible.
-		state := r.engine.Step(tickInterval) // engine lock on/off; returns a copy
-		data, err := json.Marshal(state)     // no lock held: state is our own copy
-		if err != nil {
-			slog.Error("encode state failed", "err", err)
-			continue // ! skip to the next tick; nothing to send
-		}
-		r.Broadcast(data) // room lock on/off; encoded once, same bytes to everyone
-	}
+	// ! select waits on both channels; whichever is ready first runs.
+	for {
+		select {
+		case <-ctx.Done():
+			// ! return, not break: break would only leave the select.
+			r.closeAll()
+			return
+
+		case <-ticker.C: // ! <- receives: "when the next tick arrives"
+			// Two locks, never held together: no lock-ordering deadlock.
+			state := r.engine.Step(tickInterval) // engine lock on/off; returns a copy
+			data, err := json.Marshal(state)     // no lock held: state is our own copy
+			if err != nil {
+				slog.Error("encode state failed", "err", err)
+				continue // ! skip to the next tick; nothing to send
+			}
+			r.Broadcast(data) // room lock on/off; encoded once, same bytes to everyone
+		} // end select
+	} // end for
 }
 
 // Join adds a client. Called by Serve.
@@ -64,6 +69,7 @@ func (r *Room) Join(c *Client) {
 	defer r.mu.Unlock() // let the next one in when Join returns
 
 	r.clients[c] = struct{}{} // add c to the set
+	slog.Info("client joined", "remote", c.conn.RemoteAddr().String())
 }
 
 // Leave removes a client. Called by readLoop when the connection ends.
@@ -71,16 +77,31 @@ func (r *Room) Leave(c *Client) {
 	r.mu.Lock()         // take the key (or wait for it)
 	defer r.mu.Unlock() // give it back when Leave returns
 
-	// Broadcast may have dropped c already (too slow), and closing a channel
-	// twice panics. So only act if c is still in the set.
-	// Check and close both happen under the lock: nobody can close in between.
-	// ! No loop needed: a map lookup by key finds c directly.
-	// ! (value, bool): the bool says whether the key was found
+	// Broadcast or closeAll may have removed c already; closing a channel twice panics.
+	// ! (value, bool) lookup: ok says whether c is still in the set.
 	_, ok := r.clients[c]
 	if ok {
-		delete(r.clients, c) // ! go's built-in to delete from a map
-		close(c.send)        // ends c's writeLoop (its range over c.send stops)
+		delete(r.clients, c)
+		slog.Info("client left", "remote", c.conn.RemoteAddr().String())
+		close(c.send) // ends c's writeLoop
 	}
+}
+
+// closeAll ends every client, then waits until each has sent its close frame.
+func (r *Room) closeAll() {
+	r.mu.Lock()
+	gone := make([]*Client, 0, len(r.clients))
+	for c := range r.clients {
+		delete(r.clients, c) // Leave later finds ok == false: no double close
+		close(c.send)        // ends writeLoop
+		gone = append(gone, c)
+	}
+	r.mu.Unlock() // not defer: never wait while holding the lock
+
+	for _, c := range gone {
+		<-c.done // wait for this client's writeLoop to finish
+	}
+	slog.Info("all clients closed", "count", len(gone))
 }
 
 // Broadcast queues msg for every client. Called by the tick loop (Run) each tick.
@@ -98,7 +119,8 @@ func (r *Room) Broadcast(msg []byte) {
 			// No ok check: c comes from the map and we hold the lock, so it's in the set.
 			// Not r.Leave(c): Leave locks again, and a Go mutex isn't re-entrant (deadlock).
 			delete(r.clients, c) // ! deleting inside range over a map is allowed
-			close(c.send)        // ends c's writeLoop
+			slog.Warn("client too slow, dropped", "remote", c.conn.RemoteAddr().String())
+			close(c.send) // ends c's writeLoop
 		}
 	}
 }

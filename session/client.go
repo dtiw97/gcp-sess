@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"gcp-sess/machine"
 	"log/slog"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// writeWait is the longest one write may take; a stalled client fails instead of hanging.
+const writeWait = 5 * time.Second
 
 // sendBuffer is how many outgoing messages can queue up for one client.
 // The room drops a message in and moves on, instead of waiting on a slow network.
@@ -17,7 +21,8 @@ const sendBuffer = 16
 type Client struct {
 	room *Room // the shared room this client is in: readLoop calls room.engine.Apply and room.Leave
 	conn *websocket.Conn
-	send chan []byte // outgoing messages; the room puts them in, writeLoop takes them out
+	send chan []byte   // outgoing messages; the room puts them in, writeLoop takes them out
+	done chan struct{} // closed when writeLoop finishes; closeAll waits on it
 }
 
 // NewClient takes the room from the caller: every client must point at the SAME room.
@@ -26,6 +31,7 @@ func NewClient(room *Room, conn *websocket.Conn) *Client {
 		room: room,
 		conn: conn,
 		send: make(chan []byte, sendBuffer),
+		done: make(chan struct{}), // must be made: a nil channel panics on close
 	}
 }
 
@@ -34,7 +40,6 @@ func NewClient(room *Room, conn *websocket.Conn) *Client {
 // It runs until the browser leaves or the connection breaks.
 func (c *Client) readLoop() {
 	// Registered first, so cleanup happens however the loop ends.
-
 	defer func() {
 		c.room.Leave(c) // the room removes us and closes c.send, which ends writeLoop
 		c.conn.Close()
@@ -59,17 +64,16 @@ func (c *Client) readLoop() {
 	}
 }
 
-// writeLoop takes messages from c.send and writes them to the browser.
-// It is the only code that writes to c.conn: gorilla allows one writer per connection.
-//
-// WriteMessage can wait a long time on a slow network. Because each client has its
-// own writeLoop, only that client's goroutine waits; the room and other clients don't.
+// writeLoop writes c.send to the browser; the only writer on c.conn (gorilla allows one).
+// Each client has its own, so a slow network blocks only this goroutine, for at most writeWait.
 func (c *Client) writeLoop() {
+	defer close(c.done) // runs last (defers run in reverse): signals after the conn is closed
 	// Closing the conn also makes readLoop's ReadMessage fail, so both loops end together.
 	defer c.conn.Close()
 
 	// range waits for the next message and ends when the room closes c.send.
 	for msg := range c.send {
+		c.conn.SetWriteDeadline(time.Now().Add(writeWait)) // ! a moment on the clock: reset before every write
 		// TextMessage: the browser receives a string (we'll send JSON).
 		err := c.conn.WriteMessage(websocket.TextMessage, msg)
 		if err != nil {
@@ -79,6 +83,10 @@ func (c *Client) writeLoop() {
 		}
 	}
 
-	// The room closed c.send: tell the browser we're closing, instead of just dropping it.
-	c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+	// c.send closed (shutdown, leave or dropped): say goodbye with 1001; an empty body arrives as 1005.
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	c.conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseGoingAway, "session closed"),
+	)
 }

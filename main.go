@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,11 +46,18 @@ func main() {
 	r.HealthRoutes(router, health)
 
 	// One session for the whole server (tbm-sim: maxRooms=1): the engine runs the
-	// machine, the room delivers its state. go room.Run() starts the tick loop, the
-	// room's one goroutine: it must wake every 50 ms even when no client sends anything.
+	// machine, the room delivers its state.
+
+	// * Session context: its own root (Background), NOT appCtx. SIGTERM must not stop
+	// the session; it keeps ticking through the drain. Only stopSess() (at the end) does.
+	sessCtx, stopSess := context.WithCancel(context.Background())
 	engine := session.NewEngine()
 	room := session.NewRoom(engine)
-	go room.Run()
+
+	// The tick loop, the room's one goroutine: it must wake every 50 ms even when no
+	// client sends anything. wg.Go = go + counted, so main can wait for it to finish.
+	var wg sync.WaitGroup
+	wg.Go(func() { room.Run(sessCtx) })
 	ws := h.NewWS(room)
 	r.WSRoutes(router, ws)
 
@@ -79,7 +87,7 @@ func main() {
 	<-appCtx.Done()        // * Channels sleeps main thread until it receives from channel.
 	stop()                 // Receives signal, proceed
 	health.SetReady(false) // Returns 503, kube LB stop sending.
-	slog.Info("Draining", "delay", cfg.DrainDelay.String())
+	slog.Info("Readiness false. App shutting down. Draining", "delay", cfg.DrainDelay.String())
 	time.Sleep(cfg.DrainDelay) // * Drain Delay
 
 	// * ShutDown context, sets a context of ShutdownTimeout
@@ -99,8 +107,13 @@ func main() {
 			// case B: some other failure (rare, eg: closing the listener failed)
 			slog.Error("shutdown failed", "after", time.Since(start).String(), "err", err)
 		}
-		return // don't fall through to "complete": requests were not all finished
+	} else {
+		slog.Info("server shut down complete", "after", time.Since(start).String())
 	}
+	// No return above: the session must stop on BOTH paths, or clients get 1006.
 
-	slog.Info("server shut down complete", "after", time.Since(start).String())
+	// * Stop the session last: no new clients can arrive now (Shutdown closed the door).
+	stopSess() // cancels sessCtx → Run sess ctx.Done → closeAll → returns
+	wg.Wait()  // main waits for Run; if main returned first, clients would get 1006
+	slog.Info("session stopped")
 }

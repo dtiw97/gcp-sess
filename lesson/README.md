@@ -8,7 +8,7 @@ Status: ✅ done · 🔄 in progress · ⬜ not started
 | # | Module | Status | Notes |
 |---|---|---|---|
 | 1 | Health, shutdown, config, JSON logs | ✅ | [01-health-shutdown.md](01-health-shutdown.md) |
-| 2 | WebSocket room + tick (mini tbm-sim) | 🔄 | [02-websocket-room.md](02-websocket-room.md) |
+| 2 | WebSocket room + tick (mini tbm-sim) | ✅ | [02-websocket-room.md](02-websocket-room.md) |
 | 3 | Container image | ⬜ | |
 | 4 | Registry and CI (GitHub Actions build + push) | ⬜ | |
 | 5 | Local Kubernetes with kind: Deployment, Service, probes | ⬜ | |

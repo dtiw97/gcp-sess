@@ -9,7 +9,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 | 2.1 | WebSocket upgrade: `/ws` echo | ✅ | see `git log -- handler/ws.go` |
 | 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (mutex) | see `git log -- session/room.go` |
 | 2.3 | Tick: a machine model, an engine that runs it, a tick loop that broadcasts | ✅ (mutex) | see `git log -- machine/` |
-| 2.4 | Shutdown with live connections | ⬜ | |
+| 2.4 | Shutdown with live connections | ✅ (mutex) | see `git log -- session/client.go` |
 
 ## 2.1 WebSocket upgrade
 
@@ -94,7 +94,7 @@ Authoritative server: clients send **inputs**, the server computes, and the tick
 
 ```
 IN:  client ─▶ readLoop: json.Unmarshal → engine.Apply(input)      (stores it; nothing computed)
-     tick loop, every 50 ms (go room.Run()):
+     tick loop, every 50 ms (room.Run, started by wg.Go in main):
        state := engine.Step(50ms)    engine lock on/off, returns a copy
        data  := json.Marshal(state)  no lock
        room.Broadcast(data)          room lock on/off
@@ -115,7 +115,7 @@ Three layers, three homes:
 - **Input persists**, like a real pot: no new input → the machine keeps running on the last one. Last write in a tick wins; it takes effect on the next tick, for everyone.
 - The tick count lives in the Engine (bookkeeping), not in the State. Clients don't need it: TCP keeps order, and a slow client is disconnected, never skipped, so the latest full state is enough. (Sending diffs, or skipping states, would need a sequence number.)
 
-**Why `go room.Run()`.** Defining a method doesn't start it. `Run` loops forever (`for range ticker.C`: once per tick; a ticker's channel is never closed), so without `go` main would stop there and never serve. And ticking needs a goroutine of its own: Join/Leave/Broadcast borrow a client's goroutine, but the machine must advance when nobody sends anything. A ticker holds it to real time; a bare `for {}` would run millions of steps a second.
+**Why `Run` needs its own goroutine.** Defining a method doesn't start it. `Run` loops until the session ends, so called directly, main would stop there and never serve (in 2.3 it was `go room.Run()`; 2.4 makes it `wg.Go(...)` so main can wait for it). And ticking needs a goroutine of its own: Join/Leave/Broadcast borrow a client's goroutine, but the machine must advance when nobody sends anything. A ticker holds it to real time; a bare `for {}` would run millions of steps a second.
 
 **Two mutexes, never held together.** `Room.mu` guards the client set; `Engine.mu` guards input/state/tick. The engine is shared by every readLoop (`Apply` writes `input`) and the tick loop (`Step` reads `input`, writes `state`). writeLoops never touch it. The tick loop releases the engine's lock before taking the room's, so no lock-ordering deadlock.
 
@@ -130,6 +130,38 @@ Three layers, three homes:
 **Deferred requirement (tbm-sim):** many commands in one envelope `{command: {group, action, args}}`; group `session` (start/pause/reset) → run state; group `tbm` → a command registry mutating the persistent control panel; gates before a command lands (paused → drop tbm commands). Paused = clock frozen, frames still broadcast.
 
 Tested: pot 100 for ~1.2 s → `{"input":{"potty_value":100},"output":{"speed":10,"distance":12}}`; 29 messages, all states; "not json" logged as bad input, connection kept; `-race`: 0.
+
+### 2.4 on `main`: shutdown with live connections
+
+Goal: on SIGTERM every client gets a clean **1001**, not a 1006, and nothing leaks.
+
+```
+SIGTERM → ready=false → drain (session still ticking) → server.Shutdown (no new clients)
+        → stopSess() → Run sees ctx.Done → closeAll → return → wg.Wait() returns → exit
+```
+
+- **`sessCtx` from `context.Background()`, not `appCtx`.** `appCtx` is cancelled by SIGTERM; the session must keep ticking through the drain. Only main cancels it, last.
+- **`for` + `select`** in `Run`: `for range ticker.C` can wait on one channel only; `select` waits on `ctx.Done()` and `ticker.C`, whichever first. `return`, not `break` (break only leaves the select).
+- **`closeAll`, two phases:** under the lock, delete each client and `close(c.send)`, collecting them in a slice; unlock; then `<-c.done` for each. Waiting under the lock would block every readLoop's `Leave`. A later `Leave` finds `ok == false`: no double close.
+- **Why `done`.** The WaitGroup counts only `Run`. `close(c.send)` only *asks* writeLoop to stop; without waiting, main exits and kills the writeLoops before their close frame (tested: 8 of 15 clients got 1006). The chain: `wg.Wait` → `Run` → `closeAll` → `<-c.done` → writeLoop's `defer close(c.done)`. `done` carries no data: open = still writing, closed = finished (flushed the queue, sent 1001, closed conn). Defers run in reverse, so `close(c.done)` is registered first to run last.
+- **1001 vs 1005 vs 1006.** `FormatCloseMessage(CloseGoingAway, "session closed")` → 1001. An empty close body → 1005 (no code). No close frame at all → 1006 (abnormal).
+- **Both Shutdown paths stop the session.** A Shutdown timeout cut off slow HTTP requests; the WebSocket clients still get their goodbye. No early `return`.
+- **Write deadline.** `SetWriteDeadline(time.Now().Add(writeWait))` before every write: a moment on the clock, so reset each time. Healthy writes take microseconds (they only fill the OS socket buffer); a write blocks only when the peer stopped acknowledging. Without it a dead client's writeLoop could block ~15 min, and so would `closeAll`. `Broadcast` decides "you're out"; the deadline makes sure that goroutine actually exits. Worst-case shutdown: drain 5 s + Shutdown 10 s + writeWait 5 s < Kubernetes' 30 s grace.
+- Not for now: client reconnects. A **reconnect storm** comes from the server going away (all clients at once); clients fix it with backoff + jitter. Modules 11–13.
+
+Tested (`-race`, 3 clients, SIGTERM): 9/9 got `1001 clean=true` over 3 runs, ~116 states each (kept ticking through the 5 s drain); with Shutdown forced to time out: 3/3 1001. Not tested: a real stalled network.
+
+### Mutex vs actor, after 2.4
+
+| | Mutex (`main`) | Actor (`room-actor`) |
+|---|---|---|
+| Shutdown cost | one `closeAll`; nothing else changed | `Room.done` + a `select` on every send to the room |
+| Hazard | wait under the lock; forget a lock (`-race` finds it) | send to a stopped actor hangs forever (found only by a goroutine dump) |
+| Order of events | whoever locks first | one queue: the Run loop sees everything in order |
+| Goroutines | tick loop only | Room loop (+ Sim loop) |
+| Reads its code as | methods on shared data | messages to an owner |
+
+Both needed the same client-side pieces: `done`, 1001, the WaitGroup chain. The difference is the room: a stopped mutex Room is just data (calling it later is safe); a stopped actor is a goroutine nobody listens to.
 
 ### tbm-sim design note (for later)
 
