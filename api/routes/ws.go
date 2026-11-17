@@ -7,5 +7,5 @@ import (
 )
 
 func WSRoutes(r gin.IRouter, h *handler.WS) {
-	r.GET("/ws", h.Serve)
+	r.GET("/sessions/:id/ws", h.Serve)
 }

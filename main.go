@@ -6,6 +6,7 @@ import (
 	h "gcp-sess/api/handler"
 	"gcp-sess/api/middleware"
 	r "gcp-sess/api/routes"
+	"gcp-sess/repo"
 	"gcp-sess/session"
 	u "gcp-sess/utils"
 	"log/slog"
@@ -42,24 +43,31 @@ func main() {
 		})
 	})
 
+	// Open the database before serving anything: no DB → no sessions → fail at startup.
+	store, err := repo.Open(cfg.DBPath)
+	if err != nil {
+		slog.Error("open database failed", "path", cfg.DBPath, "err", err)
+		os.Exit(1)
+	}
+	defer store.Close() // runs last, after the final save
+
 	health := &h.HealthHandler{}
 	r.HealthRoutes(router, health)
 
-	// One session for the whole server (tbm-sim: maxRooms=1): the engine runs the
-	// machine, the room delivers its state.
+	// One room for the whole server (tbm-sim: maxRooms=1). The DB holds every session;
+	// GET /sessions/:id/ws loads one into the room (if the room has no clients on another).
 
 	// * Session context: its own root (Background), NOT appCtx. SIGTERM must not stop
-	// the session; it keeps ticking through the drain. Only stopSess() (at the end) does.
+	// the room; it keeps ticking through the drain. Only stopSess() (at the end) does.
 	sessCtx, stopSess := context.WithCancel(context.Background())
-	engine := session.NewEngine()
-	room := session.NewRoom(engine)
+	sessions := session.NewManager(sessCtx, store) // owns the one Room
 
-	// The tick loop, the room's one goroutine: it must wake every 50 ms even when no
-	// client sends anything. wg.Go = go + counted, so main can wait for it to finish.
+	// The save loop: every 3 s it writes the live session to the DB; on shutdown it
+	// stops the room (clients get 1001), then saves once more. wg.Go = go + counted.
 	var wg sync.WaitGroup
-	wg.Go(func() { room.Run(sessCtx) })
-	ws := h.NewWS(room)
-	r.WSRoutes(router, ws)
+	wg.Go(sessions.Run)
+	r.SessionRoutes(router, h.NewSessionHandler(store))
+	r.WSRoutes(router, h.NewWS(sessions))
 
 	// Dummy frontend (web/index.html): served from this server so the page's origin
 	// matches /ws, which the Upgrader requires. Open http://localhost:8080/ui
@@ -113,7 +121,7 @@ func main() {
 	// No return above: the session must stop on BOTH paths, or clients get 1006.
 
 	// * Stop the session last: no new clients can arrive now (Shutdown closed the door).
-	stopSess() // cancels sessCtx → Run sess ctx.Done → closeAll → returns
-	wg.Wait()  // main waits for Run; if main returned first, clients would get 1006
+	stopSess() // cancels sessCtx → Manager.Run stops the room (closeAll) → final save
+	wg.Wait()  // main waits for Manager.Run; if main returned first, clients would get 1006
 	slog.Info("session stopped")
 }

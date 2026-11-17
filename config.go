@@ -12,6 +12,7 @@ type Config struct {
 	Port            int
 	ShutdownTimeout time.Duration
 	DrainDelay      time.Duration
+	DBPath          string // SQLite file holding the sessions
 }
 
 // LoadConfig reads Config from the environment. Unset variables fall back to
@@ -23,6 +24,7 @@ func LoadConfig() (Config, error) {
 		Port:            8080,
 		ShutdownTimeout: 10 * time.Second,
 		DrainDelay:      5 * time.Second,
+		DBPath:          "gcp-sess.db",
 	}
 
 	// LookupEnv, not Getenv: it tells "unset" (use the default) apart from "set to empty" (an error).
@@ -48,6 +50,13 @@ func LoadConfig() (Config, error) {
 			return Config{}, fmt.Errorf("DRAIN_DELAY must be at least 5s, got %q", v)
 		}
 		cfg.DrainDelay = d
+	}
+
+	if v, ok := os.LookupEnv("DB_PATH"); ok {
+		if v == "" {
+			return Config{}, fmt.Errorf("DB_PATH must not be empty")
+		}
+		cfg.DBPath = v
 	}
 
 	return cfg, nil

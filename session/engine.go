@@ -27,6 +27,11 @@ func NewEngine() *Engine {
 	return &Engine{} // zero values are ready: unlocked mutex, tick 0, machine at rest
 }
 
+// RestoreEngine resumes a saved session: same tick count, same pot position, same machine.
+func RestoreEngine(tick int, in machine.Input, st machine.State) *Engine {
+	return &Engine{tick: tick, input: in, state: st}
+}
+
 // Apply records a client's input. Called by readLoop.
 // It doesn't compute anything: the next Step uses it, so every client sees the
 // change take effect on the same step. Last one in a tick wins.
@@ -48,4 +53,13 @@ func (e *Engine) Step(dt time.Duration) machine.State {
 
 	// ! machine.State is a plain struct: this returns a copy, safe to use after unlock.
 	return e.state
+}
+
+// Snapshot copies the engine's values for saving. Called by the Manager's save loop.
+// ! Three plain values are returned: copies, safe to use after unlock.
+func (e *Engine) Snapshot() (tick int, in machine.Input, st machine.State) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.tick, e.input, e.state
 }

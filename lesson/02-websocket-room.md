@@ -10,6 +10,7 @@ Goal: turn the service into a **session server**: clients stay connected and sha
 | 2.2 | Room: many clients, one broadcast; read and write loops per client | ✅ (mutex) | see `git log -- session/room.go` |
 | 2.3 | Tick: a machine model, an engine that runs it, a tick loop that broadcasts | ✅ (mutex) | see `git log -- machine/` |
 | 2.4 | Shutdown with live connections | ✅ (mutex) | see `git log -- session/client.go` |
+| 2.5 | Sessions: create, resume, save to SQLite every 3 s (still one room) | ✅ (mutex) | see `git log -- repo/session.go` |
 
 ## 2.1 WebSocket upgrade
 
@@ -150,6 +151,49 @@ SIGTERM → ready=false → drain (session still ticking) → server.Shutdown (n
 - Not for now: client reconnects. A **reconnect storm** comes from the server going away (all clients at once); clients fix it with backoff + jitter. Modules 11–13.
 
 Tested (`-race`, 3 clients, SIGTERM): 9/9 got `1001 clean=true` over 3 runs, ~116 states each (kept ticking through the 5 s drain); with Shutdown forced to time out: 3/3 1001. Not tested: a real stalled network.
+
+### 2.5 on `main`: sessions in SQLite, still one room
+
+Goal: a user creates their own session and can come back to it later, even after a restart. The server still runs **one room** (tbm-sim: maxRooms=1); the room runs one session at a time, the DB holds all of them.
+
+```
+POST /sessions          → 201 {id, tick, state, ...}   (a row in SQLite; nothing loaded)
+GET  /sessions          → every session, newest first   (from the DB: up to 3 s old)
+GET  /sessions/:id      → one session, or 404
+GET  /sessions/:id/ws   → manager.Room(id) → upgrade → room.Serve(conn)
+```
+
+| File | Type | Job |
+|---|---|---|
+| `session/room.go` | `Room` | as in 2.4: clients, tick loop, broadcast. Adds an `id`, `Len()`, and a `closed` flag |
+| `session/engine.go` | `Engine` | as in 2.3, plus `RestoreEngine(tick, input, state)` and `Snapshot()` |
+| `session/manager.go` | `Manager` | **which** session the one room runs: load, start, stop, save every 3 s |
+| `repo/session.go` | `SessionRepo` | SQL only: `Create`, `Get`, `List`, `Load`, `Save` |
+
+`manager.Room(id)`:
+
+| The room… | Result |
+|---|---|
+| already runs `id` | return it |
+| doesn't exist yet, or runs another session with **no clients** | stop it, save it, load `id`, start a new room |
+| runs another session **with clients** | `ErrBusy` → 409 |
+| server shutting down | `ErrClosed` → 503 |
+| `id` unknown | `repo.ErrNotFound` → 404 |
+
+- **Manager, simplified for one room.** The first version had `map[id]*Room`, a WaitGroup of tick loops and a check/unlock/load/re-check dance. With one room: one `room` field, one `stop` func, and the whole of `Room()` under one lock.
+- **Switching session = stop the old room, start a new one.** Room's code doesn't change. Each room's `Run` gets a child of the session context; `stop()` cancels it and waits on a `done` channel, so after `stop()` the old engine can't step any more and the save is its final state.
+- **`m.mu` also serialises every DB write** (periodic save, save on switch, final save). An old snapshot can never overwrite a newer one. The cost: Room() and the save loop wait on the disk while holding it, a few ms. The **tick loop never takes `m.mu`**, so it never waits on the disk.
+- **Stop, then get-then-join.** A client can get the old room from `Room()`, then lose a switch race before it joins. The old room is closed, `Join` refuses, and the client gets **1001**: it can reconnect.
+- **SQLite via `modernc.org/sqlite`**: pure Go, no cgo, so Module 3's static binary still works. One file (`DB_PATH`, default `gcp-sess.db`), WAL mode, `SetMaxOpenConns(1)`. `input` and `state` are JSON text. The blank import `_ "modernc.org/sqlite"` runs its `init()`, which registers the `"sqlite"` driver.
+- **Ids:** `crypto/rand.Text()`, 26 base32 characters. Unguessable, so the id is the only "key". No auth: `GET /sessions` lists everyone's.
+- **The room ticks with nobody connected**, as in 2.4 (the machine is left on). Its progress is saved when it is switched out or on shutdown.
+- **Look up before upgrading.** Until the 101, the handler can answer 404/409/503 as plain HTTP. After it, a browser sees only 1006, so the page pre-checks `GET /sessions/:id` and treats "closed before open" as busy.
+- **Shutdown:** `stopSess()` → `Manager.Run` sets `closed`, `stop()`s the room (its `Run` does `closeAll`: 1001), final save with a fresh context. `store.Close()` runs last via `defer`.
+- **Frontend:** `/ui` shows a picker (new session, or resume one). The id goes into `?session=` and `localStorage`.
+
+Tested (`-race`): two clients on A at pot 100 → B's `/ws` gets **409**. A's clients leave, B connects → A stopped and saved (tick 50, 25 mm), B started. SIGTERM with a client on B → 1001, exit 0, B saved. Restart → A resumes at 25 mm; then B at 38.75 mm (switch again). 0 races, 0 errors.
+
+**For Module 11:** one room per process already matches Agones (one session per GameServer). But the SQLite file lives on the pod's disk: it dies with the pod and isn't shared. Expected change: a shared DB, and the allocator (Module 13) picks a free pod and tells it which session to load.
 
 ### Mutex vs actor, after 2.4
 

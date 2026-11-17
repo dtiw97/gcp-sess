@@ -34,9 +34,75 @@
     const { useEffect, useRef, useState } = React;
 
     // Same host as the page, so the Upgrader's origin check passes.
-    const WS_URL = `ws://${location.host}/ws`;
+    const wsUrl = (id) => `ws://${location.host}/sessions/${id}/ws`;
+
+    // The session id lives in the URL (?session=…, so a link or a refresh brings you
+    // back) and in localStorage (so opening /ui again resumes your last session).
+    function readSessionId() {
+      const fromUrl = new URLSearchParams(location.search).get("session");
+      if (fromUrl) return fromUrl;
+      try { return localStorage.getItem("session") || ""; } catch { return ""; }
+    }
+    function rememberSessionId(id) {
+      const url = new URL(location.href);
+      if (id) url.searchParams.set("session", id); else url.searchParams.delete("session");
+      history.replaceState(null, "", url);
+      try { id ? localStorage.setItem("session", id) : localStorage.removeItem("session"); } catch {}
+    }
+
+    // Picker: create a new session or go back to an existing one (GET /sessions).
+    function Picker({ onPick, error }) {
+      const [list, setList] = useState(null);
+      const [busy, setBusy] = useState(false);
+      useEffect(() => {
+        fetch("/sessions").then(r => r.json()).then(setList).catch(() => setList([]));
+      }, []);
+      async function create() {
+        setBusy(true);
+        const r = await fetch("/sessions", { method: "POST" });
+        setBusy(false);
+        if (r.ok) onPick((await r.json()).id);
+      }
+      return (
+        <main>
+          <h1>TBM dummy console</h1>
+          {error && <div className="card" style={{ color: "var(--bad)" }}>{error}</div>}
+          <div className="card row">
+            <span>Start a fresh machine</span>
+            <button onClick={create} disabled={busy}>New session</button>
+          </div>
+          <div className="card">
+            <div className="label">Previous sessions (saved every 3 s; one live at a time)</div>
+            {list === null && <div className="label">loading…</div>}
+            {list && list.length === 0 && <div className="label">none yet</div>}
+            {list && list.map(s => (
+              <div key={s.id} className="row" style={{ padding: "6px 0", borderTop: "1px solid var(--line)" }}>
+                <div>
+                  <div style={{ fontFamily: "monospace" }}>{s.id}</div>
+                  <div className="label">
+                    distance {s.state.output.distance.toFixed(1)} mm · pot {s.state.input.potty_value} · saved {new Date(s.updated_at).toLocaleTimeString()}
+                  </div>
+                </div>
+                <button onClick={() => onPick(s.id)}>Resume</button>
+              </div>
+            ))}
+          </div>
+        </main>
+      );
+    }
 
     function App() {
+      const [sessionId, setSessionId] = useState(readSessionId);
+      const [error, setError] = useState("");
+      function pick(id) { setError(""); rememberSessionId(id); setSessionId(id); }
+      function leave(msg) { setError(msg || ""); rememberSessionId(""); setSessionId(""); }
+      if (!sessionId) return <Picker onPick={pick} error={error} />;
+      // key: a different session id mounts a fresh Console (new socket, fresh state).
+      return <Console key={sessionId} sessionId={sessionId} onLeave={leave} />;
+    }
+
+    function Console({ sessionId, onLeave }) {
+      const WS_URL = wsUrl(sessionId);
       const wsRef = useRef(null);
       const [status, setStatus] = useState("connecting"); // connecting | open | closed
       const [closeInfo, setCloseInfo] = useState("");
@@ -50,22 +116,32 @@
         setCloseInfo("");
         const ws = new WebSocket(WS_URL);
         wsRef.current = ws;
-        ws.onopen = () => setStatus("open");
+        let opened = false, first = true;
+        ws.onopen = () => { opened = true; setStatus("open"); };
         ws.onmessage = (e) => {
           let msg;
           try { msg = JSON.parse(e.data); } catch { return; }
           if (!msg.output) return; // not a machine state (e.g. a relayed raw input)
           countRef.current++;
           setState(msg);
+          // Resuming: start the slider where the saved session left it.
+          if (first) { first = false; setPot(msg.input.potty_value); }
         };
         ws.onclose = (e) => {
+          // Never opened: the upgrade was refused (409 busy, 503 shutting down). The browser
+          // hides the HTTP status and only reports 1006, so go back to the picker with a hint.
+          if (!opened) { onLeave("Could not join: the room is probably hosting another session with clients connected."); return; }
           setStatus("closed");
           setCloseInfo(`code ${e.code}${e.reason ? ` "${e.reason}"` : ""}, clean=${e.wasClean}`);
         };
       }
 
       useEffect(() => {
-        connect();
+        // Check the session exists first: a failed upgrade (404) only shows up as code 1006.
+        fetch(`/sessions/${sessionId}`).then(r => {
+          if (r.status === 404) onLeave(`Session ${sessionId} not found.`);
+          else connect();
+        }).catch(() => connect());
         const t = setInterval(() => { setRate(countRef.current); countRef.current = 0; }, 1000);
         return () => { clearInterval(t); wsRef.current?.close(); };
       }, []);
@@ -86,6 +162,11 @@
       return (
         <main>
           <h1>TBM dummy console</h1>
+
+          <div className="card row">
+            <div><div className="label">Session</div><div style={{ fontFamily: "monospace" }}>{sessionId}</div></div>
+            <button onClick={() => { wsRef.current?.close(); onLeave(); }}>Switch session</button>
+          </div>
 
           <div className="card row">
             <div><span className="dot" style={{ background: color }} />{status} <span className="label">{WS_URL}</span></div>

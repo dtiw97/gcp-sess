@@ -1,0 +1,4 @@
+# SQLite database (DB_PATH) and its WAL files
+*.db
+*.db-wal
+*.db-shm
